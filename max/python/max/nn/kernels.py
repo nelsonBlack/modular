@@ -78,6 +78,7 @@ def fused_qkv_padded_matmul(
     wqkv: TensorValue,
     kv_collection: PagedCacheValues,
     layer_idx: TensorValue,
+    valid_lengths: TensorValue,
     n_heads: int,
 ) -> TensorValue:
     """Computes fused query, key, and value projections with padded input.
@@ -86,12 +87,15 @@ def fused_qkv_padded_matmul(
     different actual lengths but are padded to a uniform shape.
 
     Args:
-        kv_params: KV cache parameters
-        input: Input tensor with shape [batch_size, seq_len, hidden_dim]
-        wqkv: Weight tensor for Q, K, V projections
-        kv_collection: Paged KV cache collection
-        layer_idx: Layer index for cache lookup
-        n_heads: Number of attention heads
+        kv_params: KV cache parameters.
+        input: Input tensor with shape [batch_size, seq_len, hidden_dim].
+        wqkv: Weight tensor for Q, K, V projections.
+        kv_collection: Paged KV cache collection.
+        layer_idx: Layer index for cache lookup (must be uint32).
+        valid_lengths: Tensor of shape [batch] containing the valid length for each
+            sequence (must be uint32). K and V are only written to cache for
+            positions within these lengths.
+        n_heads: Number of attention heads.
 
     Returns:
         Query projections tensor. K and V projections are written to cache.
@@ -116,6 +120,16 @@ def fused_qkv_padded_matmul(
             f"expected layer_idx to have dtype uint32, was {layer_idx.dtype}"
         )
 
+    if valid_lengths.dtype != DType.uint32:
+        raise ValueError(
+            f"expected valid_lengths to have dtype uint32, was {valid_lengths.dtype}"
+        )
+
+    if valid_lengths.rank != 1:
+        raise ValueError(
+            f"expected valid_lengths to have rank 1 [batch], was rank {valid_lengths.rank}"
+        )
+
     if kv_params.cache_strategy != KVCacheStrategy.PAGED:
         raise ValueError(
             f"unsupported cache strategy for fused_qkv_padded_matmul: {kv_params.cache_strategy}"
@@ -127,7 +141,7 @@ def fused_qkv_padded_matmul(
     return ops.inplace_custom(
         op_name,
         device=input.device,
-        values=[input, wqkv, *kv_collection, layer_idx],
+        values=[input, wqkv, *kv_collection, layer_idx, valid_lengths],
         out_types=[
             TensorType(
                 dtype=input.dtype,
@@ -254,10 +268,11 @@ def fused_qkv_ragged_matmul_scaled_float8(
         )
 
     # Device check - all tensors must be on the same device
-    if not all(
-        t.device == input.device
-        for t in [wqkv, input_row_offsets, input_scale, weight_scale]
-    ):
+    tensors_to_check = [wqkv, input_row_offsets, input_scale, weight_scale]
+    if bias is not None:
+        tensors_to_check.append(bias)
+
+    if not all(t.device == input.device for t in tensors_to_check):
         raise ValueError(
             f"expected all tensors to be on the same device as input ({input.device}), "
             f"but got:\n"
@@ -265,6 +280,7 @@ def fused_qkv_ragged_matmul_scaled_float8(
             f"  input_row_offsets={input_row_offsets.device}\n"
             f"  input_scale={input_scale.device}\n"
             f"  weight_scale={weight_scale.device}"
+            + ("" if bias is None else f"\n  bias={bias.device}")
         )
 
     # layer_idx must be a scalar on CPU as it's used for indexing
@@ -288,19 +304,23 @@ def fused_qkv_ragged_matmul_scaled_float8(
     }
 
     op_name = "mo.fused_qkv_matmul.ragged.paged.scale"
+    values = [
+        input,
+        input_row_offsets,
+        wqkv,
+        input_scale,
+        weight_scale,
+        *kv_collection,
+        layer_idx,
+    ]
+    if bias is not None:
+        op_name += ".bias"
+        values.append(bias)
 
     return ops.inplace_custom(
         op_name,
         device=input.device,
-        values=[
-            input,
-            input_row_offsets,
-            wqkv,
-            input_scale,
-            weight_scale,
-            *kv_collection,
-            layer_idx,
-        ],
+        values=values,
         out_types=[
             TensorType(
                 dtype=DType.bfloat16,
@@ -845,6 +865,7 @@ def fused_qk_padded_rope(
     kv_collection: PagedCacheValues,
     freqs_cis: TensorValue,
     layer_idx: TensorValue,
+    valid_lengths: TensorValue,
     interleaved: bool = True,
 ) -> TensorValue:
     """Computes fused query-key RoPE with padded inputs and paged KV cache.
@@ -854,12 +875,15 @@ def fused_qk_padded_rope(
     fused_qk_ragged_rope.
 
     Args:
-        kv_params: KV cache parameters
-        input: Query tensor of shape [batch, seq_len, n_heads, head_dim]
-        kv_collection: Paged KV cache collection
-        freqs_cis: Frequency tensor of shape (max_seq_len * 2, head_dim)
-        layer_idx: Layer index for KV cache (must be uint32 on CPU)
-        interleaved: Whether to use interleaved RoPE pattern
+        kv_params: KV cache parameters.
+        input: Query tensor of shape [batch, seq_len, n_heads, head_dim].
+        kv_collection: Paged KV cache collection.
+        freqs_cis: Frequency tensor of shape (max_seq_len * 2, head_dim).
+        layer_idx: Layer index for KV cache (must be uint32 on CPU).
+        valid_lengths: Tensor of shape [batch] containing the valid length for each
+            sequence (must be uint32). RoPE is only applied to positions within
+            these lengths.
+        interleaved: Whether to use interleaved RoPE pattern.
 
     Returns:
         Query tensor with RoPE applied, same shape as input.
@@ -874,6 +898,11 @@ def fused_qk_padded_rope(
             f"expected layer_idx to have dtype uint32, was {layer_idx.dtype}"
         )
 
+    if valid_lengths.dtype != DType.uint32:
+        raise ValueError(
+            f"expected valid_lengths to have dtype uint32, was {valid_lengths.dtype}"
+        )
+
     if kv_params.cache_strategy != KVCacheStrategy.PAGED:
         raise ValueError(
             f"unsupported cache strategy for fused_qk_padded_rope: {kv_params.cache_strategy}"
@@ -882,6 +911,11 @@ def fused_qk_padded_rope(
     if input.rank != 4:
         raise ValueError(
             f"expected input to have rank 4 [batch, seq_len, n_heads, head_dim], was rank {input.rank}"
+        )
+
+    if valid_lengths.rank != 1:
+        raise ValueError(
+            f"expected valid_lengths to have rank 1 [batch], was rank {valid_lengths.rank}"
         )
 
     parameters: dict[str, bool | int | str | DType] = {
@@ -899,6 +933,7 @@ def fused_qk_padded_rope(
             *kv_collection,
             freqs_cis,
             layer_idx,
+            valid_lengths,
         ],
         out_types=[
             TensorType(
@@ -2757,6 +2792,266 @@ def dynamic_scaled_matmul(
     return result
 
 
+def dynamic_block_scaled_matmul_fp4(
+    a: TensorValue,
+    b: TensorValue,
+    a_scales: TensorValue,
+    b_scales: TensorValue,
+    tensor_sf: float,
+    sf_vector_size: int = 16,
+    out_type: DType = DType.bfloat16,
+) -> TensorValue:
+    """
+    Perform a matmul of two FP4 tensors with 1D-block scaled scaling factors.
+
+    Args:
+        a: The first tensor to multiply.
+        b: The second tensor to multiply, must be transposed.
+        a_scales: The scaling factors for the first tensor.
+        b_scales: The scaling factors for the second tensor.
+
+    Returns:
+        The result of the matmul operation.
+    """
+
+    if a.rank != 2 or b.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+    if a_scales.rank != 5 or b_scales.rank != 5:
+        raise ValueError("Both a_scales and b_scales must be rank 5 tensors")
+
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            "The second dimension of b must match the second dimension of a"
+        )
+
+    if (a.dtype != b.dtype) or (a_scales.dtype != b_scales.dtype):
+        raise TypeError(
+            f"a and b dtypes {a.dtype}, {b.dtype} must match, "
+            f"as do a and b scales dtypes {a_scales.dtype}, {b_scales.dtype}"
+        )
+
+    if a.dtype != DType.uint8:
+        raise ValueError("A dtype must be uint8 (fp4-e2m1fnX2)")
+
+    if a_scales.dtype != DType.float8_e4m3fn:
+        raise ValueError("a_scales dtype must be float8_e4m3fn")
+
+    if sf_vector_size != 16:
+        raise ValueError("sf_vector_size must be 16 for NVFP4")
+
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    SF_K_GROUP_SIZE = SF_ATOM_K * sf_vector_size
+
+    # scales tensor shape: [ceildiv(M, SF_MN_GROUP_SIZE), ceildiv(N, sf_vector_size * 4), SF_ATOM_M[0], SF_ATOM_M[1], SF_ATOM_K]
+    # a_scales_dim_0 = (a.shape[0] + SF_MN_GROUP_SIZE - 1) // SF_MN_GROUP_SIZE
+    a_scales_dim_1 = (
+        (a.shape[1] * 2) + SF_K_GROUP_SIZE - 1
+    ) // SF_K_GROUP_SIZE  # each output element (uint8) is 2 fp4-e2m1fn values
+    b_scales_dim_0 = (b.shape[0] + SF_MN_GROUP_SIZE - 1) // SF_MN_GROUP_SIZE
+    b_scales_dim_1 = (
+        (b.shape[1] * 2) + SF_K_GROUP_SIZE - 1
+    ) // SF_K_GROUP_SIZE  # each output element (uint8) is 2 fp4-e2m1fn values
+    scales_dim_2 = SF_ATOM_M[0]
+    scales_dim_3 = SF_ATOM_M[1]
+    scales_dim_4 = SF_ATOM_K
+
+    if (
+        a_scales.shape[1] != a_scales_dim_1
+        or a_scales.shape[2] != scales_dim_2
+        or a_scales.shape[3] != scales_dim_3
+        or a_scales.shape[4] != scales_dim_4
+    ):
+        raise ValueError(
+            f"a_scales shape must be {a_scales_dim_1, scales_dim_2, scales_dim_3, scales_dim_4}, but got {a_scales.shape}"
+        )
+
+    if (
+        b_scales.shape[0] != b_scales_dim_0
+        or b_scales.shape[1] != b_scales_dim_1
+        or b_scales.shape[2] != scales_dim_2
+        or b_scales.shape[3] != scales_dim_3
+        or b_scales.shape[4] != scales_dim_4
+    ):
+        raise ValueError(
+            f"b_scales shape must be {b_scales_dim_0, b_scales_dim_1, scales_dim_2, scales_dim_3, scales_dim_4}, but got {b_scales.shape}"
+        )
+
+    result = ops.custom(
+        "mo.matmul.dynamic.block.scaled",
+        device=a.device,
+        values=[
+            a,
+            b,
+            a_scales,
+            b_scales,
+            ops.constant(tensor_sf, DType.float32, device=DeviceRef.CPU()),
+        ],
+        out_types=[
+            TensorType(
+                dtype=out_type, shape=[a.shape[0], b.shape[0]], device=a.device
+            )
+        ],
+        parameters={
+            "SF_VECTOR_SIZE": sf_vector_size,
+        },
+    )[0].tensor
+
+    return result
+
+
+def quantize_dynamic_block_scaled_fp4(
+    input: TensorValue,
+    tensor_sf: float,
+    sf_vector_size: int = 16,
+    scales_type: DType = DType.float8_e4m3fn,
+    out_type: DType = DType.uint8,  # fp4-e2m1fnX2
+) -> tuple[TensorValue, TensorValue]:
+    """
+    Dynamically quantize the input tensor to fp4-e2m1fn.
+
+    Args:
+        input: The input tensor to quantize. Shape: [seq_len, hidden_size]
+        tensor_sf: The tensor-wise scale factor.
+        sf_vector_size: The block size for the scaling factors.
+        out_type: The type of the output tensor.
+        scales_type: The type of the scales tensor.
+
+    Returns:
+        The quantized tensor in [seq_len, hidden_size // 2] layout and the scales in [ceildiv(seq_len, 128), ceildiv(hidden_size, sf_vector_size * 4), 32, 4, 4] layout.
+    """
+
+    if input.rank != 2:
+        raise ValueError("input tensor must be rank 2 tensor")
+
+    if input.dtype != DType.bfloat16:
+        raise ValueError("input tensor dtype must be bfloat16")
+
+    if out_type not in (DType.uint8,):
+        raise ValueError("out_type must be uint8 (fp4-e2m1fnX2)")
+
+    if scales_type not in (DType.float8_e4m3fn,):
+        raise ValueError("scales_type must be float8_e4m3fn for NVFP4")
+
+    if sf_vector_size != 16:
+        raise ValueError("sf_vector_size must be 16 for NVFP4")
+
+    if int(input.shape[1]) % (sf_vector_size // 2) != 0:
+        raise ValueError(
+            "input.shape[1] must be a multiple of (sf_vector_size // 2)"
+        )
+
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    SF_K_GROUP_SIZE = SF_ATOM_K * sf_vector_size
+
+    # scales tensor shape: [ceildiv(M, SF_MN_GROUP_SIZE), ceildiv(N, sf_vector_size * 4), SF_ATOM_M[0], SF_ATOM_M[1], SF_ATOM_K]
+    scales_dim_0 = (input.shape[0] + SF_MN_GROUP_SIZE - 1) // SF_MN_GROUP_SIZE
+    scales_dim_1 = (input.shape[1] + SF_K_GROUP_SIZE - 1) // SF_K_GROUP_SIZE
+    scales_dim_2 = SF_ATOM_M[0]
+    scales_dim_3 = SF_ATOM_M[1]
+    scales_dim_4 = SF_ATOM_K
+
+    result = ops.custom(
+        "mo.quantize.dynamic.block.scaled",
+        device=input.device,
+        values=[
+            input,
+            ops.constant(tensor_sf, DType.float32, device=DeviceRef.CPU()),
+        ],
+        out_types=[
+            TensorType(
+                dtype=out_type,
+                shape=[
+                    input.shape[0],
+                    input.shape[1] // 2,
+                ],  # each output element (uint8) is 2 fp4-e2m1fn values
+                device=input.device,
+            ),
+            TensorType(
+                dtype=scales_type,
+                shape=[
+                    scales_dim_0,
+                    scales_dim_1,
+                    scales_dim_2,
+                    scales_dim_3,
+                    scales_dim_4,
+                ],
+                device=input.device,
+            ),
+        ],
+        parameters={
+            "SF_VECTOR_SIZE": sf_vector_size,
+        },
+    )
+
+    return result[0].tensor, result[1].tensor
+
+
+def block_scales_interleave(
+    scales: TensorValue,
+    sf_vector_size: int = 16,
+    scales_type: DType = DType.float8_e4m3fn,
+) -> TensorValue:
+    """
+    Interleave the block scales tensor in [M, N] layout to [ceildiv(M, 128), ceildiv(N, sf_vector_size * 4), 32, 4, 4] layout.
+
+    Args:
+        scales: The scales tensor to interleave in [M, N] layout.
+        sf_vector_size: The block size for the scaling factors.
+
+    Returns:
+        The interleaved scales tensor in [ceildiv(M, 128), ceildiv(N, sf_vector_size * 4), 32, 4, 4] layout.
+    """
+
+    if scales.rank != 2:
+        raise ValueError("Both a and b must be rank 2 tensors")
+
+    if scales.dtype != DType.float8_e4m3fn:
+        raise ValueError("scales dtype must be float8_e4m3fn")
+
+    if sf_vector_size != 16:
+        raise ValueError("sf_vector_size must be 16 for NVFP4")
+
+    SF_ATOM_M = [32, 4]
+    SF_ATOM_K = 4
+    SF_MN_GROUP_SIZE = SF_ATOM_M[0] * SF_ATOM_M[1]  # 128
+    SF_K_GROUP_SIZE = SF_ATOM_K * sf_vector_size
+
+    # scales tensor shape: [ceildiv(M, SF_MN_GROUP_SIZE), ceildiv(N, sf_vector_size * 4), SF_ATOM_M[0], SF_ATOM_M[1], SF_ATOM_K]
+    scales_dim_0 = (scales.shape[0] + SF_MN_GROUP_SIZE - 1) // SF_MN_GROUP_SIZE
+    scales_dim_1 = (scales.shape[1] + SF_K_GROUP_SIZE - 1) // SF_K_GROUP_SIZE
+    scales_dim_2 = SF_ATOM_M[0]
+    scales_dim_3 = SF_ATOM_M[1]
+    scales_dim_4 = SF_ATOM_K
+
+    result = ops.custom(
+        "mo.interleave.block.scales",
+        device=scales.device,
+        values=[scales],
+        out_types=[
+            TensorType(
+                dtype=scales_type,
+                shape=[
+                    scales_dim_0,
+                    scales_dim_1,
+                    scales_dim_2,
+                    scales_dim_3,
+                    scales_dim_4,
+                ],
+                device=scales.device,
+            ),
+        ],
+        parameters={
+            "SF_VECTOR_SIZE": sf_vector_size,
+        },
+    )[0].tensor
+
+    return result
+
+
 def matmul_static_scaled_float8(
     input: TensorValue,
     weight: TensorValue,
@@ -3385,6 +3680,7 @@ def sgmv_lora_qkv_shrink(
     lora_a: TensorValue,
     lora_ids: TensorValue,
     lora_grouped_offsets: TensorValue,
+    lora_end_idx: TensorValue,
     max_lora_seq_len: int,
     max_rank: int,
 ) -> TensorValue:
@@ -3429,7 +3725,7 @@ def sgmv_lora_qkv_shrink(
         out_types=[
             TensorType(
                 dtype=input.dtype,
-                shape=[3, input.shape[0], max_rank],
+                shape=[3, lora_end_idx.shape[0], max_rank],
                 device=input.device,
             ),
         ],
@@ -3491,6 +3787,7 @@ def sgmv_qkv_lora_kernel(
         lora_a=lora_a,
         lora_ids=lora_ids,
         lora_grouped_offsets=lora_grouped_offsets,
+        lora_end_idx=lora_end_idx,
         max_lora_seq_len=max_lora_seq_len,
         max_rank=max_rank,
     )
@@ -3509,7 +3806,7 @@ def sgmv_qkv_lora_kernel(
         bias,
     )
 
-    v_kv = ops.reshape(v_qkv[1:, :, :], [2 * input.shape[0], -1])
+    v_kv = ops.reshape(v_qkv[1:, :, :], [2 * lora_end_idx.shape[0], -1])
 
     # expand GMM-KV:   [2M, N] @ [2G, KVdim, N] // KV stacked in dim 0
     kv_out = sgmv_kernel(

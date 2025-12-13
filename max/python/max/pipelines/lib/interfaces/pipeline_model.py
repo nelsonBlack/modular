@@ -27,11 +27,13 @@ from max.graph.weights import Weights, WeightsAdapter
 from max.interfaces import BaseContextType, LogProbabilities
 from max.kv_cache import infer_optimal_batch_size
 from max.nn.kv_cache import KVCacheInputs
-from max.nn.transformer import ReturnLogits
+from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from transformers import AutoConfig
 
 if TYPE_CHECKING:
     from ..config import PipelineConfig
+
+from max.graph import DeviceRef
 
 from ..config_enums import SupportedEncoding
 from ..kv_cache_config import KVCacheConfig
@@ -88,6 +90,9 @@ class ModelOutputs:
     logit_offsets: Tensor | None = None
     """Offsets to access variable length logits for each sequence."""
 
+    hidden_states: Tensor | None = None
+    """Hidden states for a variable number of tokens per sequence."""
+
 
 class ModelInputs:
     """
@@ -126,6 +131,9 @@ class ModelInputs:
     lora_ranks: Tensor | None = None
     """Tensor containing the LoRA ranks"""
 
+    hidden_states: Tensor | None = None
+    """Hidden states for a variable number of tokens per sequence."""
+
     def update(self, **kwargs) -> None:
         key: str
         value: Any
@@ -154,15 +162,18 @@ class PipelineModel(ABC, Generic[BaseContextType]):
         weights: Weights,
         adapter: WeightsAdapter | None,
         return_logits: ReturnLogits,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
     ) -> None:
         self.pipeline_config = pipeline_config
         self.huggingface_config = huggingface_config
         self.encoding = encoding
         self.devices = devices
+        self.device_refs = [DeviceRef.from_device(d) for d in devices]
         self.kv_cache_config = kv_cache_config
         self.weights = weights
         self.adapter = adapter
         self.return_logits = return_logits
+        self.return_hidden_states = return_hidden_states
 
         # Initialize `max_seq_len` here to avoid repeated HF config access.
         self.max_seq_len = self.calculate_max_seq_len(
@@ -170,8 +181,24 @@ class PipelineModel(ABC, Generic[BaseContextType]):
         )
 
         if isinstance(self, KVCacheMixin):
+            self.kv_params = self.get_kv_params(
+                huggingface_config=huggingface_config,
+                devices=self.device_refs,
+                kv_cache_config=kv_cache_config,
+                cache_dtype=encoding.cache_dtype,
+            )
+            assert self.kv_cache_config._available_cache_memory is not None, (
+                "Available cache memory should have been set during memory estimation"
+            )
+            assert pipeline_config.max_batch_size is not None, (
+                "max_batch_size should have been set during memory estimation"
+            )
             self.kv_manager = self.load_kv_manager(
-                session, self.kv_cache_config._available_cache_memory
+                kv_params=self.kv_params,
+                max_batch_size=pipeline_config.max_batch_size,
+                max_seq_len=self.max_seq_len,
+                session=session,
+                available_cache_memory=self.kv_cache_config._available_cache_memory,
             )
 
         self._lora_manager: LoRAManager | None = (
@@ -296,7 +323,7 @@ class PipelineModel(ABC, Generic[BaseContextType]):
 
         kv_params = cls.get_kv_params(
             huggingface_config=huggingface_config,
-            n_devices=len(devices),
+            devices=[DeviceRef.from_device(d) for d in devices],
             kv_cache_config=kv_cache_config,
             cache_dtype=cache_dtype,
         )

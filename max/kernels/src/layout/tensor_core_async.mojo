@@ -35,7 +35,6 @@ Performance features:
 This implementation is specifically optimized for NVIDIA GPUs with Tensor Core support.
 """
 from collections import OptionalReg
-from memory import LegacyUnsafePointer as UnsafePointer
 from sys import size_of, bit_width_of
 from sys._assembly import inlined_assembly
 
@@ -411,40 +410,7 @@ fn tile_layout_mn_major[
         This returns the "unit" layout; the actual shared memory layout can be a multiple of this unit.
         Currently only supports SWIZZLE_NONE and SWIZZLE_128B modes.
     """
-    constrained[
-        swizzle_mode
-        in (TensorMapSwizzle.SWIZZLE_NONE, TensorMapSwizzle.SWIZZLE_128B),
-        "Only support 128B and no swizzle",
-    ]()
-
-    @parameter
-    if swizzle_mode == TensorMapSwizzle.SWIZZLE_128B:
-        # See comments in file header.
-        comptime row_len = swizzle_mode.bytes() // size_of[dtype]()
-        return Layout(
-            [
-                [row_len, mn_dim // row_len],
-                [_CM_NUM_ROWS, k_dim // _CM_NUM_ROWS],
-            ],
-            [
-                [1, _CM_NUM_ROWS * row_len],
-                [row_len, _CM_NUM_ROWS * mn_dim],
-            ],
-        )
-
-    # No swizzle
-    # Number of elements per row in core matrix
-    comptime _CM_ROW_LEN = _CM_ROW_BYTES // size_of[dtype]()
-    return Layout(
-        [
-            [_CM_ROW_LEN, mn_dim // _CM_ROW_LEN],
-            [_CM_NUM_ROWS, k_dim // _CM_NUM_ROWS],
-        ],
-        [
-            [1, _CM_NUM_ROWS * _CM_ROW_LEN],
-            [_CM_ROW_LEN, _CM_NUM_ROWS * mn_dim],
-        ],
-    )
+    return tile_layout_k_major[dtype, k_dim, mn_dim, swizzle_mode]().transpose()
 
 
 fn wgmma_c_thread_layout[C: Layout]() -> Layout:
@@ -1040,7 +1006,7 @@ struct TensorCoreAsync[
             ".\na_frag_tile.layout[0].shape[0].value() = ",
             String(a_frag_tile.layout[0].shape[0].value()),
             "\nnum_k_mmas = ",
-            String(num_k_mmas),
+            String(num_k_mmas) + "\nb_smem_layout = " + String(b_smem_layout),
         ]()
 
         b_desc = _wgmma_descriptor[

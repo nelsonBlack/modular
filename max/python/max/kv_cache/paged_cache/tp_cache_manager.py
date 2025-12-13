@@ -16,40 +16,25 @@
 from __future__ import annotations
 
 import logging
-import queue
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import numpy as np
 from max.driver import Device, Tensor
-from max.dtype import DType
 from max.engine import InferenceSession
-from max.graph import BufferType, DeviceRef, TensorType
-from max.interfaces import RequestID, TextGenerationContext, get_blocking
-from max.nn.kv_cache.cache_params import KVCacheParams
-from max.nn.kv_cache.manager import RaggedKVCacheInputs
+from max.interfaces import RequestID, TextGenerationContext
+from max.nn.kv_cache import KVCacheParams, RaggedKVCacheInputs
 from max.nn.kv_cache.metrics import KVCacheMetrics
-from max.nn.kv_cache.nested_iterable import NestedIterableDataclass
 from max.nn.kv_cache.utils import build_max_lengths_tensor
 from max.profiler import traced
 from max.serve.kvcache_agent.kvcache_agent_service_v1_pb2 import (  # type: ignore
     MemoryTier,
 )
-from max.serve.queue.zmq_queue import ZmqPullSocket, ZmqPushSocket
 from max.support.math import ceildiv
 
 from .block_copy_engine import BlockCopyEngine
 from .block_manager import BlockManager
 
 logger = logging.getLogger("max.pipelines")
-
-
-@dataclass
-class PagedCacheInputSymbols(NestedIterableDataclass):
-    kv_blocks: BufferType
-    cache_lengths: TensorType
-    lookup_table: TensorType
-    max_lengths: TensorType
 
 
 class _TPPagedKVCacheManager:
@@ -96,11 +81,8 @@ class _TPPagedKVCacheManager:
         params: KVCacheParams,
         total_num_pages: int,
         total_num_host_pages: int,
-        max_batch_size: int,
-        max_seq_len: int,
         devices: Sequence[Device],
         session: InferenceSession,
-        zmq_endpoint_base: str | None = None,
         enable_runtime_checks: bool = False,
     ) -> None:
         """Initialize the tensor-parallel paged KV cache manager.
@@ -115,8 +97,6 @@ class _TPPagedKVCacheManager:
         self.params = params
         self.total_num_pages = total_num_pages
         self.total_num_host_pages = total_num_host_pages
-        self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
         self.page_size = params.page_size
         self.devices = devices
         self.session = session
@@ -124,7 +104,7 @@ class _TPPagedKVCacheManager:
         # Validate devices aligns with the n_devices in params
         if len(devices) != params.n_devices:
             raise ValueError(
-                "n_devices provided in KVCacheParams, does not match number of devices initialized in the _TPPagedKVCacheManager"
+                "Number of devices provided in KVCacheParams does not match the number of devices initialized in the _TPPagedKVCacheManager"
             )
 
         if params.data_parallel_degree > 1:
@@ -137,13 +117,6 @@ class _TPPagedKVCacheManager:
 
         # Whether prefix caching is enabled.
         self.enable_prefix_caching = self.params.enable_prefix_caching
-
-        # Watches for requests to reset the prefix cache.
-        self.reset_prefix_cache_backend: ResetPrefixCacheBackend | None = None
-        if zmq_endpoint_base is not None and self.enable_prefix_caching:
-            self.reset_prefix_cache_backend = ResetPrefixCacheBackend(
-                zmq_endpoint_base
-            )
 
         # Whether kvcache swapping to host is enabled
         self.enable_kvcache_swapping_to_host = (
@@ -276,10 +249,6 @@ class _TPPagedKVCacheManager:
         if self.block_copy_engine is not None:
             self.block_copy_engine.wait_for_completion()
 
-        if self.reset_prefix_cache_backend is not None:
-            if self.reset_prefix_cache_backend.should_reset_prefix_cache():
-                self.reset_prefix_cache()
-
         max_seq_len = -1
         for batch_idx, ctx in enumerate(batch):  # noqa: B007
             # Allocate blocks for request if we need more.
@@ -290,10 +259,6 @@ class _TPPagedKVCacheManager:
 
             # Compute the total sequence length
             seq_len = ctx.current_length + num_steps - 1
-            if seq_len > self.max_seq_len:
-                raise RuntimeError(
-                    f"Request has current length ({ctx.current_length}) + num_steps ({num_steps}) - 1 = {seq_len} which exceeds model max_seq_len of {self.max_seq_len}"
-                )
             max_seq_len = max(max_seq_len, seq_len)
 
         # Allocate the buffers containing metadata about the batch.
@@ -361,66 +326,6 @@ class _TPPagedKVCacheManager:
 
         return ret_list
 
-    def get_symbolic_inputs(
-        self,
-        devices: Sequence[Device] | None = None,
-        num_layers: int | None = None,
-    ) -> Sequence[NestedIterableDataclass]:
-        return self._input_symbols(devices, num_layers, dynamic_dim_prefix="")
-
-    def _input_symbols(
-        self,
-        devices: Sequence[Device] | None = None,
-        num_layers: int | None = None,
-        dynamic_dim_prefix: str = "",
-    ) -> Sequence[PagedCacheInputSymbols]:
-        """Returns the input symbols for the paged KV cache.
-
-        Args:
-            devices: The devices to use for the input symbols.
-            num_layers: The number of layers to use for the input symbols.
-            dynamic_dim_prefix: The prefix to use for the dynamic dimensions.
-                This is used to differentiate between the different inputs
-                between replicas.
-        """
-        if devices is None:
-            devices = self.devices
-
-        if num_layers is None:
-            num_layers = self.params.num_layers
-
-        return [
-            PagedCacheInputSymbols(
-                kv_blocks=BufferType(
-                    self.params.dtype,
-                    shape=[
-                        "total_num_pages",
-                        *self.params.shape_per_block,
-                    ],
-                    device=DeviceRef(device.label, device.id),
-                ),
-                cache_lengths=TensorType(
-                    DType.uint32,
-                    shape=[dynamic_dim_prefix + "batch_size"],
-                    device=DeviceRef(device.label, device.id),
-                ),
-                lookup_table=TensorType(
-                    DType.uint32,
-                    shape=[
-                        dynamic_dim_prefix + "batch_size",
-                        dynamic_dim_prefix + "max_num_pages",
-                    ],
-                    device=DeviceRef(device.label, device.id),
-                ),
-                max_lengths=TensorType(
-                    DType.uint32,
-                    shape=[dynamic_dim_prefix + "steps_remaining", 2],
-                    device=DeviceRef.CPU(),
-                ),
-            )
-            for device in devices
-        ]
-
     def release(self, request_id: RequestID) -> None:
         """Release the sequence associated with :obj:`request_id`, marking this sequence as complete.
         This returns the sequence ID back to the available pool of cache memory,
@@ -487,10 +392,6 @@ class _TPPagedKVCacheManager:
         """Reserve a sequence ID for the given request ID."""
         if request_id in self._claimed_requests:
             raise ValueError(f"Request ID {request_id} is already claimed")
-        if len(self._claimed_requests) == self.max_batch_size:
-            raise ValueError(
-                f"Unable to claim request ID {request_id} due to batch size limit."
-            )
         self._claimed_requests.add(request_id)
 
     def contains(self, request_id: RequestID) -> bool:
@@ -513,39 +414,3 @@ class _TPPagedKVCacheManager:
 
     def reset_prefix_cache(self) -> None:
         self.block_manager.reset_prefix_cache()
-
-
-ZMQ_RESET_PREFIX_CACHE_ENDPOINT = "reset_prefix_cache"
-
-
-class ResetPrefixCacheBackend:
-    def __init__(self, zmq_endpoint_base: str):
-        self.socket = ZmqPullSocket[None](
-            endpoint=f"{zmq_endpoint_base}-{ZMQ_RESET_PREFIX_CACHE_ENDPOINT}",
-            payload_type=None,
-        )
-
-    def should_reset_prefix_cache(self, blocking: bool = False) -> bool:
-        # If blocking is True, we do not return until we receive a message from
-        # the frontend to reset the prefix cache. Hence, it will always return True.
-        if blocking:
-            get_blocking(self.socket)
-            return True
-
-        # If non-blocking, we return True if there is a message in the queue.
-        try:
-            self.socket.get_nowait()
-            return True
-        except queue.Empty:
-            return False
-
-
-class ResetPrefixCacheFrontend:
-    def __init__(self, zmq_endpoint_base: str):
-        self.socket = ZmqPushSocket[None](
-            endpoint=f"{zmq_endpoint_base}-{ZMQ_RESET_PREFIX_CACHE_ENDPOINT}",
-            payload_type=None,
-        )
-
-    def enqueue_reset_prefix_cache(self) -> None:
-        self.socket.put_nowait(None)

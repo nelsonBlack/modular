@@ -54,7 +54,8 @@ from buffer import NDBuffer
 from buffer.dimlist import Dim, DimList
 from builtin.simd import _pow
 from comm.allgather import allgather
-from comm.allreduce import MAX_GPUS, Signal, allreduce
+from comm.allreduce import allreduce
+from comm import MAX_GPUS, Signal
 from compiler_internal import StaticTensorSpec
 from gpu.host import DeviceContext, get_gpu_target
 from gpu.host.info import is_cpu, is_gpu, is_valid_target
@@ -77,6 +78,11 @@ from linalg.fp8_quantization import (
     quantize_dynamic_scaled_fp8,
     quantize_static_scaled_fp8,
     batched_quantize_dynamic_scaled_fp8,
+)
+from linalg.fp4_quantization import (
+    block_scaled_matmul,
+    quantize_dynamic_block_scaled,
+    block_scales_interleave,
 )
 from linalg.grouped_matmul_sm100_blockwise_fp8 import (
     grouped_matmul_dynamic_scaled_fp8,
@@ -4746,16 +4752,12 @@ struct Conv:
                 ]()
 
                 var cuda_ctx = ctx.get_device_context()
-                var pad_tuple = IndexList[input.rank - 2](0)
+
+                var pad_tuple = IndexList[2 * (input.rank - 2)](0)
 
                 @parameter
-                if input.rank == 4:
-                    pad_tuple[0] = pad_h_tuple[0]
-                    pad_tuple[1] = pad_w_tuple[0]
-                elif input.rank == 5:
-                    pad_tuple[0] = pad_d_tuple[0]
-                    pad_tuple[1] = pad_h_tuple[0]
-                    pad_tuple[2] = pad_w_tuple[0]
+                for i in range(2 * (input.rank - 2)):
+                    pad_tuple[i] = Int(paddings._ptr[i])
 
                 conv_gpu[
                     input_buf.layout,  # input shape
@@ -6100,6 +6102,9 @@ fn generic_fused_qkv_matmul_kv_cache_bshd_paged_kernel_api[
         *_,
     ],
     layer_idx: UInt32,
+    valid_lengths: LayoutTensor[
+        DType.uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
+    ],
     output: ManagedTensorSlice[dtype=dtype, rank=3],
     ctx: DeviceContextPtr,
 ) raises:
@@ -6108,6 +6113,7 @@ fn generic_fused_qkv_matmul_kv_cache_bshd_paged_kernel_api[
         weight.to_layout_tensor(),
         kv_collection,
         layer_idx,
+        valid_lengths,
         output.to_layout_tensor(),
         ctx,
     )
@@ -6129,6 +6135,7 @@ struct Struct_fused_qkv_matmul_padded_paged:
         kv_lookup_table: InputTensor[dtype = DType.uint32, rank=2],
         max_lengths: InputTensor[dtype = DType.uint32, rank=2],
         layer_idx: UInt32,
+        valid_lengths: InputTensor[dtype = DType.uint32, rank=1],
         ctx: DeviceContextPtr,
     ) raises:
         var kv_collection = generic_get_paged_cache(
@@ -6138,11 +6145,20 @@ struct Struct_fused_qkv_matmul_padded_paged:
             max_lengths,
         )
 
+        var valid_lengths_lt = valid_lengths.to_layout_tensor()
         generic_fused_qkv_matmul_kv_cache_bshd_paged[target=target](
             hidden_state.to_layout_tensor(),
             weight.to_layout_tensor(),
             kv_collection,
             layer_idx,
+            LayoutTensor[
+                DType.uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
+            ](
+                valid_lengths_lt.ptr,
+                RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
+                    valid_lengths_lt.runtime_layout.shape.value.canonicalize()
+                ),
+            ),
             output.to_layout_tensor(),
             ctx,
         )
@@ -6315,6 +6331,71 @@ struct Struct_fused_qkv_matmul_padded_ragged_scale:
             layer_idx,
             output.to_layout_tensor(),
             ctx,
+            OptionalReg[
+                LayoutTensor[
+                    mut=False,
+                    output_type,
+                    Layout.row_major(UNKNOWN_VALUE),
+                    ImmutAnyOrigin,
+                    address_space = AddressSpace.GENERIC,
+                ]
+            ](),
+        )
+
+
+@compiler.register("mo.fused_qkv_matmul.ragged.paged.scale.bias")
+struct Struct_fused_qkv_matmul_padded_ragged_scale_bias:
+    @always_inline
+    @staticmethod
+    fn execute[
+        dtype: DType,
+        scale_type: DType,
+        output_type: DType,
+        kv_type: DType, //,
+        target: StaticString,
+    ](
+        output: OutputTensor[dtype=output_type, rank=2],
+        hidden_state: InputTensor[dtype=dtype, rank=2],
+        input_row_offsets: InputTensor[dtype = DType.uint32, rank=1],
+        weight: InputTensor[dtype=dtype, rank=2],
+        input_scale: InputTensor[dtype=scale_type, rank=2],
+        weight_scale: InputTensor[dtype=scale_type, rank=2],
+        kv_blocks: MutableInputTensor[dtype=kv_type, rank=6],
+        cache_lengths: InputTensor[dtype = DType.uint32, rank=1],
+        kv_lookup_table: InputTensor[dtype = DType.uint32, rank=2],
+        max_lengths: InputTensor[dtype = DType.uint32, rank=2],
+        layer_idx: UInt32,
+        bias: InputTensor[dtype=output_type, rank=1],
+        ctx: DeviceContextPtr,
+    ) raises:
+        var kv_collection = generic_get_paged_cache(
+            kv_blocks,
+            cache_lengths,
+            kv_lookup_table,
+            max_lengths,
+        )
+        comptime ExpectedBiasType = LayoutTensor[
+            mut=False,
+            output_type,
+            Layout.row_major(UNKNOWN_VALUE),
+            ImmutAnyOrigin,
+            address_space = AddressSpace.GENERIC,
+        ]
+        var bias_tensor = bias.to_layout_tensor()
+        var rebound_bias = rebind[ExpectedBiasType](bias_tensor)
+        return generic_fused_qkv_matmul_kv_cache_paged_ragged_scale[
+            target=target
+        ](
+            hidden_state.to_layout_tensor(),
+            input_row_offsets.to_layout_tensor(),
+            weight.to_layout_tensor(),
+            input_scale.to_layout_tensor(),
+            weight_scale.to_layout_tensor(),
+            kv_collection,
+            layer_idx,
+            output.to_layout_tensor(),
+            ctx,
+            OptionalReg[ExpectedBiasType](rebound_bias),
         )
 
 
@@ -6520,6 +6601,7 @@ struct Struct_fused_qk_rope_padded_paged[interleaved: Bool]:
         max_lengths: InputTensor[dtype = DType.uint32, rank=2],
         freqs_cis: InputTensor[dtype=dtype, rank=2],
         layer_idx: UInt32,
+        valid_lengths: InputTensor[dtype = DType.uint32, rank=1],
         context: DeviceContextPtr = DeviceContextPtr(),
     ) raises:
         var kv_collection = generic_get_paged_cache(
@@ -6528,6 +6610,7 @@ struct Struct_fused_qk_rope_padded_paged[interleaved: Bool]:
             kv_lookup_table,
             max_lengths,
         )
+        var valid_lengths_lt = valid_lengths.to_layout_tensor()
         generic_fused_qk_rope_bshd_paged[
             interleaved = Self.interleaved,
             target=target,
@@ -6536,6 +6619,14 @@ struct Struct_fused_qk_rope_padded_paged[interleaved: Bool]:
             kv_collection,
             freqs_cis.to_layout_tensor(),
             layer_idx,
+            LayoutTensor[
+                DType.uint32, Layout.row_major(UNKNOWN_VALUE), MutAnyOrigin
+            ](
+                valid_lengths_lt.ptr,
+                RuntimeLayout[Layout.row_major(UNKNOWN_VALUE)].row_major(
+                    valid_lengths_lt.runtime_layout.shape.value.canonicalize()
+                ),
+            ),
             output.to_layout_tensor(),
             context,
         )
@@ -7374,6 +7465,117 @@ struct Struct_batched_matmul_dynamic_scaled_fp8:
             managed_tensor_slice_to_ndbuffer(b),
             managed_tensor_slice_to_ndbuffer(a_scales),
             managed_tensor_slice_to_ndbuffer(b_scales),
+            cuda_ctx,
+        )
+
+
+@compiler.register("mo.matmul.dynamic.block.scaled")
+struct Struct_matmul_dynamic_block_scaled:
+    @always_inline
+    @staticmethod
+    fn execute[
+        c_type: DType,
+        a_type: DType,
+        b_type: DType,
+        scales_type: DType, //,
+        SF_VECTOR_SIZE: Int,
+        target: StaticString,
+    ](
+        c: OutputTensor[dtype=c_type, rank=2],
+        a: InputTensor[dtype=a_type, rank=2],
+        b: InputTensor[dtype=b_type, rank=2],
+        a_scales: InputTensor[dtype=scales_type, rank=5],
+        b_scales: InputTensor[dtype=scales_type, rank=5],
+        tensor_sf: Float32,
+        context: DeviceContextPtr,
+    ) raises:
+        constrained[
+            is_gpu[target](),
+            (
+                "dynamic block scaled matmul only support GPUs with native"
+                " block scaled support"
+            ),
+        ]()
+
+        cuda_ctx = context.get_device_context()
+        block_scaled_matmul[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            transpose_b=True,
+            target=target,
+        ](
+            managed_tensor_slice_to_ndbuffer(c),
+            managed_tensor_slice_to_ndbuffer(a),
+            managed_tensor_slice_to_ndbuffer(b),
+            managed_tensor_slice_to_ndbuffer(a_scales),
+            managed_tensor_slice_to_ndbuffer(b_scales),
+            tensor_sf,
+            cuda_ctx,
+        )
+
+
+@compiler.register("mo.quantize.dynamic.block.scaled")
+struct Struct_quantize_dynamic_block_scaled:
+    @always_inline
+    @staticmethod
+    fn execute[
+        out_dtype: DType,
+        scales_type: DType,
+        in_dtype: DType, //,
+        SF_VECTOR_SIZE: Int,
+        target: StaticString,
+    ](
+        output: OutputTensor[dtype=out_dtype, rank=2],
+        scales: OutputTensor[dtype=scales_type, rank=5],
+        input: InputTensor[dtype=in_dtype, rank=2],
+        tensor_sf: Float32,
+        context: DeviceContextPtr,
+    ) raises:
+        constrained[
+            is_gpu[target](),
+            (
+                "quantize dynamic block scaled only support GPUs with native"
+                " block scaled support"
+            ),
+        ]()
+
+        cuda_ctx = context.get_device_context()
+        quantize_dynamic_block_scaled[
+            SF_VECTOR_SIZE=SF_VECTOR_SIZE,
+            target=target,
+        ](
+            managed_tensor_slice_to_ndbuffer(output),
+            managed_tensor_slice_to_ndbuffer(scales),
+            managed_tensor_slice_to_ndbuffer(input),
+            tensor_sf,
+            cuda_ctx,
+        )
+
+
+@compiler.register("mo.interleave.block.scales")
+struct Struct_interleave_block_scales:
+    @always_inline
+    @staticmethod
+    fn execute[
+        scales_type: DType, //,
+        SF_VECTOR_SIZE: Int,
+        target: StaticString,
+    ](
+        output_scales: OutputTensor[dtype=scales_type, rank=5],
+        input_scales: InputTensor[dtype=scales_type, rank=2],
+        context: DeviceContextPtr,
+    ) raises:
+        constrained[
+            is_gpu[target](),
+            (
+                "quantize dynamic block scaled only support GPUs with native"
+                " block scaled support"
+            ),
+        ]()
+
+        cuda_ctx = context.get_device_context()
+        block_scales_interleave[SF_VECTOR_SIZE=SF_VECTOR_SIZE, target=target,](
+            managed_tensor_slice_to_ndbuffer(output_scales),
+            managed_tensor_slice_to_ndbuffer(input_scales),
             cuda_ctx,
         )
 

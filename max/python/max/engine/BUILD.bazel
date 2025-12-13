@@ -5,11 +5,11 @@ package(default_visibility = ["//max:consumers"])
 modular_py_library(
     name = "engine",
     srcs = glob(["**/*.py"]),
-    imports = ["../.."],
     deps = [
         "//max/python/max:_core",
         "//max/python/max/driver",
         "//max/python/max/dtype",
+        "//max/python/max/graph",
         "//max/python/max/profiler",
         "@mojo//:python",
         requirement("numpy"),

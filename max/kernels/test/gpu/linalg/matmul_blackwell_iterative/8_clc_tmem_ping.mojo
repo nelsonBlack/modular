@@ -1012,7 +1012,6 @@ fn blackwell_kernel_8[
         Index(
             BN // (cluster_shape[0] // cta_group), BK
         ) if transpose_b else Index(BK, BN // (cluster_shape[0] // cta_group)),
-        is_k_major=transpose_b,
         swizzle_mode=b_swizzle,
     ](ctx, b)
 
@@ -1342,6 +1341,7 @@ fn make_dic_of_shapes() -> (
 
 
 fn benchmark_blackwell_matmul(ctx: DeviceContext) raises:
+    @parameter
     for swizzle in [TensorMapSwizzle.SWIZZLE_128B]:
         print("Benchmarking blackwell_matmul_tma_umma_kernel")
         print("============================================")
@@ -1368,8 +1368,8 @@ fn benchmark_blackwell_matmul(ctx: DeviceContext) raises:
                     block_tile_shape,
                     umma_shape,
                     cluster_shape = StaticTuple[Int32, 3](2, 1, 1),
-                    a_swizzle = TensorMapSwizzle.SWIZZLE_128B,
-                    b_swizzle = TensorMapSwizzle.SWIZZLE_128B,
+                    a_swizzle=swizzle,
+                    b_swizzle=swizzle,
                     benchmark=True,
                     M = shape[0],
                     N = shape[1],

@@ -25,13 +25,7 @@ from max.engine import InferenceSession, Model
 from max.graph import DeviceRef, Graph, Value
 from max.graph.weights import WeightData, Weights, WeightsAdapter
 from max.interfaces import LogProbabilities
-from max.kv_cache import (
-    NullKVCacheManager,
-    PagedKVCacheManager,
-    estimate_kv_cache_size,
-    load_kv_manager,
-)
-from max.nn import ReturnLogits
+from max.nn import ReturnHiddenStates, ReturnLogits
 from max.nn.kv_cache import KVCacheInputs, KVCacheParams, PagedCacheValues
 from max.pipelines.core import TextContext
 from max.pipelines.lib import (
@@ -148,6 +142,7 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
         weights: Weights,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
     ) -> None:
         """
         Args:
@@ -164,6 +159,7 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
             weights,
             adapter,
             return_logits,
+            return_hidden_states,
         )
         self.model = self.load_model(session)
         self.logprobs_device = devices[0]
@@ -175,12 +171,12 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
     def get_kv_params(
         cls,
         huggingface_config: AutoConfig,
-        n_devices: int,
+        devices: list[DeviceRef],
         kv_cache_config: KVCacheConfig,
         cache_dtype: DType,
     ) -> KVCacheParams:
         return Llama3Config.get_kv_params(
-            huggingface_config, n_devices, kv_cache_config, cache_dtype
+            huggingface_config, devices, kv_cache_config, cache_dtype
         )
 
     @classmethod
@@ -239,8 +235,26 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 *curr_kv_cache_inputs,
             )
 
-        if len(model_outputs) == 3:
-            assert isinstance(model_outputs[0], Tensor)
+        has_offsets = self.return_logits in (
+            ReturnLogits.VARIABLE,
+            ReturnLogits.ALL,
+        )
+        has_hidden_states = self.return_hidden_states != ReturnHiddenStates.NONE
+
+        assert isinstance(model_outputs[0], Tensor)
+        if has_offsets and has_hidden_states:
+            assert len(model_outputs) == 4
+            assert isinstance(model_outputs[1], Tensor)
+            assert isinstance(model_outputs[2], Tensor)
+            assert isinstance(model_outputs[3], Tensor)
+            return ModelOutputs(
+                logits=model_outputs[1],
+                next_token_logits=model_outputs[0],
+                logit_offsets=model_outputs[2],
+                hidden_states=model_outputs[3],
+            )
+        elif has_offsets:
+            assert len(model_outputs) == 3
             assert isinstance(model_outputs[1], Tensor)
             assert isinstance(model_outputs[2], Tensor)
             return ModelOutputs(
@@ -248,10 +262,19 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
                 next_token_logits=model_outputs[0],
                 logit_offsets=model_outputs[2],
             )
-        else:
-            assert isinstance(model_outputs[0], Tensor)
+        elif has_hidden_states:
+            assert len(model_outputs) == 2
+            assert isinstance(model_outputs[1], Tensor)
             return ModelOutputs(
-                logits=model_outputs[0], next_token_logits=model_outputs[0]
+                logits=model_outputs[0],
+                next_token_logits=model_outputs[0],
+                hidden_states=model_outputs[1],
+            )
+        else:
+            assert len(model_outputs) == 1
+            return ModelOutputs(
+                logits=model_outputs[0],
+                next_token_logits=model_outputs[0],
             )
 
     def prepare_initial_token_inputs(
@@ -365,55 +388,6 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
             pipeline_config, huggingface_config
         )
 
-    def load_kv_manager(
-        self,
-        session: InferenceSession,
-        available_cache_memory: int | None,
-    ) -> PagedKVCacheManager | NullKVCacheManager:
-        n_devices_for_cache = len(self.devices)
-
-        return load_kv_manager(
-            params=Llama3Config.get_kv_params(
-                huggingface_config=self.huggingface_config,
-                n_devices=n_devices_for_cache,
-                kv_cache_config=self.kv_cache_config,
-                cache_dtype=self.encoding.cache_dtype,
-                data_parallel_degree=self.pipeline_config.model_config.data_parallel_degree,
-            ),
-            max_batch_size=self.pipeline_config.max_batch_size,
-            max_seq_len=self.calculate_max_seq_len(
-                self.pipeline_config, huggingface_config=self.huggingface_config
-            ),
-            devices=self.devices,
-            available_cache_memory=available_cache_memory,
-            session=session,
-        )
-
-    @classmethod
-    def estimate_kv_cache_size(
-        cls,
-        pipeline_config: PipelineConfig,
-        available_cache_memory: int,
-        devices: list[Device],
-        huggingface_config: AutoConfig,
-        kv_cache_config: KVCacheConfig,
-        cache_dtype: DType,
-    ) -> int:
-        """Estimates the size of the kv cache in bytes."""
-        return estimate_kv_cache_size(
-            params=Llama3Config.get_kv_params(
-                huggingface_config=huggingface_config,
-                n_devices=len(devices),
-                kv_cache_config=kv_cache_config,
-                cache_dtype=cache_dtype,
-            ),
-            max_batch_size=pipeline_config.max_batch_size,
-            max_seq_len=cls.calculate_max_seq_len(
-                pipeline_config, huggingface_config=huggingface_config
-            ),
-            available_cache_memory=available_cache_memory,
-        )
-
     @traced
     def load_model(self, session: InferenceSession) -> Model:
         # Pre-allocate a buffer for input_row_offsets in multistep execution.
@@ -459,12 +433,12 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
     ) -> list[PagedCacheValues]:
         kv_params = Llama3Config.get_kv_params(
             huggingface_config=self.huggingface_config,
-            n_devices=len(self.devices),
+            devices=[DeviceRef.from_device(d) for d in self.devices],
             kv_cache_config=self.kv_cache_config,
             cache_dtype=self.encoding.cache_dtype,
         )
         n_devices = kv_params.n_devices
-        fetch_types = self.kv_manager.get_symbolic_inputs()[0]
+        fetch_types = kv_params.get_symbolic_inputs()[0]
         len_of_kv_tuple_per_dev = len(list(fetch_types))
         kv_caches_per_dev: list[PagedCacheValues] = []
         for i in range(n_devices):
@@ -515,12 +489,13 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
             cache_dtype=self.encoding.cache_dtype,
             kv_cache_config=self.kv_cache_config,
             return_logits=self.return_logits,
+            return_hidden_states=self.return_hidden_states,
             data_parallel_degree=self.pipeline_config.model_config.data_parallel_degree,
         )
 
         if model_config.data_parallel_degree > 1:
             graph, new_state_dict = create_data_parallel_graph(
-                model_config, self.kv_manager, state_dict
+                model_config, self.kv_params, state_dict
             )
             self.state_dict = new_state_dict
             return graph
@@ -541,7 +516,7 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
 
             with Graph(
                 getattr(self.huggingface_config, "model_type", "llama3"),
-                input_types=dist_model.input_types(self.kv_manager),
+                input_types=dist_model.input_types(self.kv_params),
             ) as graph:
                 tokens, input_row_offsets, return_n_logits, *variadic_args = (
                     graph.inputs
@@ -587,7 +562,7 @@ class LlamaModelBase(PipelineModel[TextContext], KVCacheMixin):
             with Graph(
                 "llama3",
                 input_types=single_model.input_types(
-                    self.kv_manager, self._lora_manager
+                    self.kv_params, self._lora_manager
                 ),
             ) as graph:
                 if self._lora_manager:
@@ -687,6 +662,7 @@ class Llama3Model(LlamaModelBase):
         weights: Weights,
         adapter: WeightsAdapter | None = None,
         return_logits: ReturnLogits = ReturnLogits.LAST_TOKEN,
+        return_hidden_states: ReturnHiddenStates = ReturnHiddenStates.NONE,
     ) -> None:
         super().__init__(
             pipeline_config,
@@ -698,4 +674,5 @@ class Llama3Model(LlamaModelBase):
             weights,
             adapter,
             return_logits,
+            return_hidden_states,
         )

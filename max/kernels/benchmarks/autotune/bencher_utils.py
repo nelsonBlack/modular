@@ -14,6 +14,7 @@
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -72,13 +73,13 @@ class Bench:
             f"{m.metric.name} ({m.metric.unit})" for m in self.metric_list
         ]
         s = [self.BENCH_LABEL, self.ITERS_LABEL, self.MET_LABEL] + metrics
-        output += [", ".join(s)]
+        output += [",".join(s)]
 
         metric_vals = [
             f"{m.compute(self.met * 1e-3)}" for m in self.metric_list
         ]
         vals = [self.name, self.iters, self.met] + metric_vals
-        output += [", ".join([str(v) for v in vals])]
+        output += [",".join([str(v) for v in vals])]
 
         output_str = "\n".join(output)
         with open(output_path, "w") as f:
@@ -87,7 +88,7 @@ class Bench:
         print(output_str)
 
 
-def arg_parse(handle: str, default: str = "", short_handle: str = "") -> str:
+def arg_parse(handle: str, default: Any = None, short_handle: str = "") -> str:
     # TODO: add constraints on dtype of return value
 
     handle = handle.lstrip("-")

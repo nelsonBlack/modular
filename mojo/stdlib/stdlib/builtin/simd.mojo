@@ -196,6 +196,19 @@ This type is encoded as `seeeemmm`:
 - fn: finite (no inf or -inf encodings)
 - uz: unsigned zero (no -0 encoding)
 """
+comptime Float8_e8m0fnu = Scalar[DType.float8_e8m0fnu]
+"""Represents the 8-bit E8M0FNU floating point format.
+
+This type is defined in the [OCP MX
+spec](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf),
+encoded as `eeeeeeee`:
+- (e)xponent: 8 bits
+- (m)antissa: 0 bits
+- exponent bias: 127
+- nan: 11111111
+- fn: finite (no inf or -inf encodings)
+- u: unsigned (no sign bit or zero value)
+"""
 comptime BFloat16 = Scalar[DType.bfloat16]
 """Represents a 16-bit brain floating point value."""
 comptime Float16 = Scalar[DType.float16]
@@ -528,7 +541,7 @@ struct SIMD[dtype: DType, size: Int](
     comptime device_type: AnyType = Self
     """SIMD types are remapped to the same type when passed to accelerator devices."""
 
-    fn _to_device_type(self, target: LegacyOpaquePointer):
+    fn _to_device_type(self, target: MutOpaquePointer[_]):
         """Device type mapping is the identity function."""
         target.bitcast[Self.device_type]()[] = self
 

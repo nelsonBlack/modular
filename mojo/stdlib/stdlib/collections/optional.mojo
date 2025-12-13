@@ -39,7 +39,6 @@ from utils import Variant
 from builtin.constrained import _constrained_conforms_to
 from builtin.device_passable import DevicePassable
 from compile import get_type_name
-from memory import LegacyOpaquePointer as OpaquePointer
 
 
 # TODO(27780): NoneType can't currently conform to traits
@@ -53,7 +52,7 @@ struct _NoneType(ImplicitlyCopyable):
 # ===-----------------------------------------------------------------------===#
 
 
-struct Optional[T: Copyable](
+struct Optional[T: Movable](
     Boolable,
     Defaultable,
     ImplicitlyCopyable,
@@ -529,7 +528,7 @@ struct OptionalReg[T: AnyTrivialRegType](Boolable, Defaultable, DevicePassable):
     comptime device_type: AnyType = Self
     """The device-side type for this optional register."""
 
-    fn _to_device_type(self, target: OpaquePointer):
+    fn _to_device_type(self, target: MutOpaquePointer[_]):
         target.bitcast[Self.device_type]()[] = self
 
     @staticmethod

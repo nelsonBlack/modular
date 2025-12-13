@@ -85,7 +85,7 @@ PINS = {
     "nvidia-cutlass-dsl": "nvidia-cutlass-dsl@4.3.0",
     "nvitop": "nvitop@1.4.0",
     "onnxruntime": "onnxruntime@1.23.1",
-    "openai": "openai@1.52.2",
+    "openai": "openai@2.11.0",
     "opencv-python": "opencv-python@4.11.0.86",
     "opentelemetry-api": "opentelemetry-api@1.35.0",
     "opentelemetry-exporter-otlp-proto-http": "opentelemetry-exporter-otlp-proto-http@1.35.0",
@@ -98,6 +98,7 @@ PINS = {
     "peft": "peft@0.13.2",
     "pillow": "pillow@12.0.0",
     "platformdirs": "platformdirs@4.2.2",
+    "plotext": "plotext@5.3.2",
     "plotly": "plotly@6.0.1",
     "pre-commit": "pre-commit@4.0.1",
     "prometheus-client": "prometheus-client@0.20.0",
@@ -163,7 +164,6 @@ PINS = {
     "uvicorn": "uvicorn@0.30.6",
     "uvloop": "uvloop@0.22.1",
     "wheel": "wheel@0.45.1",
-    "xxhash": "xxhash@3.6.0",
     "zhconv": "zhconv@1.4.3",
     "zhon": "zhon@2.1.1",
 }
@@ -4632,7 +4632,7 @@ def targets():
         testonly = "onnxruntime" in _TESTONLY_DEPS,
     )
 
-    _openai_1_52_2_deps = [
+    _openai_2_11_0_deps = [
         ":anyio@4.4.0",
         ":distro@1.9.0",
         ":httpx@0.27.2",
@@ -4644,14 +4644,14 @@ def targets():
     ]
 
     native.alias(
-        name = "_wheel_openai@1.52.2",
-        actual = "@pycross_lock_file_wheel_openai_1.52.2_py3_none_any//file",
+        name = "_wheel_openai@2.11.0",
+        actual = "@pycross_lock_file_wheel_openai_2.11.0_py3_none_any//file",
     )
 
     pycross_wheel_library(
-        name = "openai@1.52.2",
-        deps = _openai_1_52_2_deps,
-        wheel = ":_wheel_openai@1.52.2",
+        name = "openai@2.11.0",
+        deps = _openai_2_11_0_deps,
+        wheel = ":_wheel_openai@2.11.0",
         testonly = "openai" in _TESTONLY_DEPS,
     )
 
@@ -5009,6 +5009,17 @@ def targets():
         name = "platformdirs@4.2.2",
         wheel = ":_wheel_platformdirs@4.2.2",
         testonly = "platformdirs" in _TESTONLY_DEPS,
+    )
+
+    native.alias(
+        name = "_wheel_plotext@5.3.2",
+        actual = "@pycross_lock_file_wheel_plotext_5.3.2_py3_none_any//file",
+    )
+
+    pycross_wheel_library(
+        name = "plotext@5.3.2",
+        wheel = ":_wheel_plotext@5.3.2",
+        testonly = "plotext" in _TESTONLY_DEPS,
     )
 
     _plotly_6_0_1_deps = [
@@ -14913,12 +14924,12 @@ def repositories():
 
     maybe(
         http_file,
-        name = "pycross_lock_file_wheel_openai_1.52.2_py3_none_any",
+        name = "pycross_lock_file_wheel_openai_2.11.0_py3_none_any",
         urls = [
-            "https://files.pythonhosted.org/packages/55/4c/906b5b32c4c01402ac3b4c3fc28f601443ac5c6f13c84a95dd178c8d545d/openai-1.52.2-py3-none-any.whl",
+            "https://files.pythonhosted.org/packages/e5/f1/d9251b565fce9f8daeb45611e3e0d2f7f248429e40908dcee3b6fe1b5944/openai-2.11.0-py3-none-any.whl",
         ],
-        sha256 = "57e9e37bc407f39bb6ec3a27d7e8fb9728b2779936daa1fcf95df17d3edfaccc",
-        downloaded_file_path = "openai-1.52.2-py3-none-any.whl",
+        sha256 = "21189da44d2e3d027b08c7a920ba4454b8b7d6d30ae7e64d9de11dbe946d4faa",
+        downloaded_file_path = "openai-2.11.0-py3-none-any.whl",
     )
 
     maybe(
@@ -15419,6 +15430,16 @@ def repositories():
         ],
         sha256 = "2d7a1657e36a80ea911db832a8a6ece5ee53d8de21edd5cc5879af6530b1bfee",
         downloaded_file_path = "platformdirs-4.2.2-py3-none-any.whl",
+    )
+
+    maybe(
+        http_file,
+        name = "pycross_lock_file_wheel_plotext_5.3.2_py3_none_any",
+        urls = [
+            "https://files.pythonhosted.org/packages/f6/1e/12fe7c40cd2099a1f454518754ed229b01beaf3bbb343127f0cc13ce6c22/plotext-5.3.2-py3-none-any.whl",
+        ],
+        sha256 = "394362349c1ddbf319548cfac17ca65e6d5dfc03200c40dfdc0503b3e95a2283",
+        downloaded_file_path = "plotext-5.3.2-py3-none-any.whl",
     )
 
     maybe(

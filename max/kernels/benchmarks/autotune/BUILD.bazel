@@ -1,4 +1,4 @@
-load("//bazel:api.bzl", "modular_py_binary", "modular_py_test", "pkg_files", "requirement")
+load("//bazel:api.bzl", "modular_py_binary", "modular_py_library", "modular_py_test", "pkg_files", "requirement")
 
 package(default_visibility = ["//max:consumers"])
 
@@ -6,7 +6,6 @@ modular_py_binary(
     name = "kbench",
     srcs = [
         "__init__.py",
-        "bencher_utils.py",
         "kbench.py",
         "kbench_model.py",
         "utils.py",
@@ -49,6 +48,10 @@ modular_py_binary(
         requirement("scipy"),
         requirement("plotly"),
         requirement("tabulate"),
+        requirement("torch"),
+        requirement("packaging"),
+        "//max/kernels/benchmarks/autotune:bencher_utils",
+        "//max/kernels/benchmarks/misc/comparison:bench_baseline_lib",
     ],
 )
 
@@ -113,6 +116,14 @@ modular_py_binary(
     ],
 )
 
+modular_py_library(
+    name = "bencher_utils",
+    srcs = [
+        "bencher_utils.py",
+    ],
+    imports = ["."],
+)
+
 modular_py_test(
     name = "autotune_tests",
     srcs = glob(["tests/*.py"]),
@@ -145,6 +156,7 @@ modular_py_test(
     ],
 )
 
+# TODO: this probably can be removed safely.
 pkg_files(
     name = "autotune_files",
     srcs = [

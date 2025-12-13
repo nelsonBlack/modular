@@ -58,6 +58,7 @@ from gpu.host.compile import (
 )
 from memory import stack_allocation
 from memory.unsafe import bitcast
+from builtin.rebind import downcast
 
 from utils import Variant
 from utils._serialize import _serialize_elements
@@ -786,7 +787,7 @@ struct DeviceBuffer[dtype: DType](
     comptime device_type: AnyType = LegacyUnsafePointer[Scalar[Self.dtype]]
     """DeviceBuffer dtypes are remapped to UnsafePointer when passed to accelerator devices."""
 
-    fn _to_device_type(self, target: LegacyOpaquePointer):
+    fn _to_device_type(self, target: MutOpaquePointer[_]):
         """Device dtype mapping from DeviceBuffer to the device's UnsafePointer.
         """
         # TODO: Allow the low-level DeviceContext implementation to intercept
@@ -1521,7 +1522,7 @@ struct DeviceStream(ImplicitlyCopyable):
         Raises:
             If the wait operation fails.
         """
-        # const char *AsyncRT_DeviceStream_enqueue_enqueue_wait_for(const DeviceStream *stream, const DeviceEvent *event)
+        # const char *AsyncRT_DeviceStream_waitForEvent(const DeviceStream *stream, const DeviceEvent *event)
         _checked(
             external_call[
                 "AsyncRT_DeviceStream_waitForEvent",
@@ -1565,7 +1566,7 @@ struct DeviceStream(ImplicitlyCopyable):
         default_stream.record_event(event)
         ```
         """
-        # const char *AsyncRT_DeviceStream_event_record(const DeviceStream *stream, const DeviceEvent *event)
+        # const char *AsyncRT_DeviceStream_eventRecord(const DeviceStream *stream, const DeviceEvent *event)
         _checked(
             external_call[
                 "AsyncRT_DeviceStream_eventRecord",
@@ -1849,29 +1850,6 @@ struct DeviceEvent(ImplicitlyCopyable):
 
     var _handle: _DeviceEventPtr
     """Internal handle to the native event object."""
-
-    @doc_private
-    @always_inline
-    fn __init__(out self, stream: DeviceStream) raises:
-        """Creates a new event recorded on the given stream.
-
-        Args:
-            stream: The stream to record the event on.
-
-        Raises:
-            If event creation or recording fails.
-        """
-        var result: _DeviceEventPtr = {}
-        # const char *AsyncRT_DeviceStream_enqueue_event(const DeviceEvent **result, const DeviceStream *stream)
-        _checked(
-            external_call[
-                "AsyncRT_DeviceStream_eventCreate",
-                _ConstCharPtr,
-                UnsafePointer[_DeviceEventPtr, origin_of(result)],
-                _DeviceStreamPtr,
-            ](UnsafePointer(to=result), stream._handle)
-        )
-        self._handle = result
 
     @doc_private
     @always_inline
@@ -2646,6 +2624,15 @@ struct DeviceFunction[
             comptime declared_arg_type = Self.declared_arg_types.value()[i]
             comptime actual_arg_type = Ts[i]
 
+            fn declared_arg_type_name() -> String:
+                @parameter
+                if conforms_to(declared_arg_type, DevicePassable):
+                    return downcast[
+                        DevicePassable, declared_arg_type
+                    ].get_type_name()
+                else:
+                    return get_type_name[declared_arg_type]()
+
             # Now we'll check if the given argument's device_type is
             # what the kernel expects.
 
@@ -2658,12 +2645,13 @@ struct DeviceFunction[
                 __comptime_assert _type_is_eq[
                     declared_arg_type, actual_arg_type.device_type
                 ](), String(
-                    "Handed in wrong argument dtype for argument #",
-                    String(i),
-                    ", received a ",
+                    "argument #",
+                    i,
+                    " of type '",
                     actual_arg_type.get_type_name(),
-                    ", but actual type name is: ",
-                    get_type_name[declared_arg_type](),
+                    "' does not match the declared function argument type '",
+                    declared_arg_type_name(),
+                    "'",
                 )
             elif _is_pointer_convertible[
                 declared_arg_type, actual_arg_type.device_type
@@ -2680,13 +2668,13 @@ struct DeviceFunction[
                 __comptime_assert _type_is_eq[
                     declared_arg_type, actual_arg_type.device_type
                 ](), String(
-                    "Handed in wrong argument dtype for argument #",
-                    String(i),
-                    ", received a ",
+                    "argument #",
+                    i,
+                    " of type '",
                     actual_arg_type.get_type_name(),
-                    " (which became device dtype ",
-                    actual_arg_type.get_device_type_name(),
-                    ")",
+                    "' (which became device of type '",
+                    declared_arg_type_name(),
+                    "') does not match the declared function argument type",
                 )
             var aligned_type_size = align_up(
                 size_of[actual_arg_type.device_type](), 8
@@ -3706,7 +3694,7 @@ struct DeviceContext(ImplicitlyCopyable):
 
         Pinned memory is guaranteed to remain resident in the host's RAM, not be
         paged/swapped out to disk. Memory allocated normally (for example, using
-        [`UnsafePointer.alloc()`](/mojo/stdlib/memory/unsafe_ptr/UnsafePointer#alloc))
+        [`alloc()`](/mojo/stdlib/memory/unsafe_pointer/alloc))
         is pageable—individual pages of memory can be moved to secondary storage
         (disk/SSD) when main memory fills up.
 
@@ -6242,7 +6230,7 @@ struct DeviceContext(ImplicitlyCopyable):
         if interprocess:
             flags |= EventFlags.interprocess
 
-        # const char *AsyncRT_DeviceContext_event_create(const DeviceEvent **result, const DeviceContext *ctx, unsigned int flags)
+        # const char *AsyncRT_DeviceContext_eventCreate(const DeviceEvent **result, const DeviceContext *ctx, unsigned int flags)
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_eventCreate",
@@ -6293,7 +6281,7 @@ struct DeviceContext(ImplicitlyCopyable):
         var flags: c_uint = 0 if blocking else 1
         var result = _DeviceStreamPtr()
 
-        # const char *AsyncRT_cuda_create_stream_with_priority(CUstream *stream, int priority, const DeviceContext *ctx)
+        # const char *AsyncRT_streamCreate(const DeviceStream **stream, const DeviceContext *ctx, unsigned int flags)
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_streamCreate",
@@ -6329,7 +6317,7 @@ struct DeviceContext(ImplicitlyCopyable):
         var flags: c_uint = 0 if blocking else 1
         var result = _DeviceStreamPtr()
 
-        # const char *AsyncRT_cuda_create_stream_with_priority(CUstream *stream, int priority, const DeviceContext *ctx)
+        # const char *AsyncRT_streamCreateWithPriority(const DeviceStream **stream, unsigned int flags, int priority, const DeviceContext *ctx)
         _checked(
             external_call[
                 "AsyncRT_DeviceContext_streamCreateWithPriority",
